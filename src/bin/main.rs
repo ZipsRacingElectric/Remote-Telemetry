@@ -9,8 +9,9 @@
 
 use defmt::{info, warn};
 use esp_hal::clock::CpuClock;
-use esp_hal::main;
-use esp_hal::riscv::register::{marchid, mvendorid};
+use esp_hal::delay::Delay;
+use esp_hal::time::Duration;
+use esp_hal::{main, uart};
 use panic_rtt_target as _;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -26,32 +27,83 @@ fn main() -> ! {
     rtt_target::rtt_init_defmt!();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let _peripherals = esp_hal::init(config);
+    let peripherals = esp_hal::init(config);
 
-    let vendorid = unsafe { *(0xF11 as *const u32) };
-    let proper_id = mvendorid::read();
-    if proper_id.bits() != vendorid as usize {
-        warn!("Vendor id fetched through different methods differs");
+    // pinout: Radio Pin # -> ESP32 Pin #
+    // 6 Vcc -> ESP32 3v3
+    // 7 Gnd -> ESP32 GND
+    // 3 SDO -> ESP32 4 (UART Rx)
+    // 4 SDI -> ESP32 5 (UART Tx)
+    //
+    // Serial data rate default 19.2kbps
+
+    let mut uart0 = match uart::Uart::new(
+        peripherals.UART1,
+        uart::Config::default().with_baudrate(19200),
+    ) {
+        Ok(val) => val,
+        Err(err) => panic!("Failed to initialize uart: {:?}", err),
     }
+    .with_rx(peripherals.GPIO4)
+    .with_tx(peripherals.GPIO5);
 
-    info!("Raw vendor id is {:x}", vendorid);
-    info!(
-        "Proper VendorID contains {} continuation bytes",
-        proper_id.offset()
-    );
-
-    let mut out_id = [0u8; 4];
-    for (b, idx) in proper_id.jedec_manufacturer().zip(0..).take(4) {
-        out_id[idx] = b;
+    let delay = Delay::new();
+    loop {
+        delay.delay(Duration::from_millis(1000));
+        match get_radio_uart_speed(&mut uart0) {
+            Ok(speed) => info!("Got uart speed of {}bps", speed),
+            Err(UartError::RxError(err)) => warn!("Failed to get uart speed: {:?}", err),
+            Err(UartError::TxError(err)) => warn!("Failed to get uart speed: {:?}", err),
+        }
     }
-    info!("Proper vendor id {:x}", out_id);
+}
 
-    let archid = unsafe { *(0xF12 as *const u32) };
-    let proper_arch = marchid::read();
-    if archid as usize != proper_arch.bits() {
-        warn!("Arch id fetched through different methods differs");
+#[derive(Debug)]
+enum UartError {
+    RxError(uart::RxError),
+    TxError(uart::TxError),
+}
+
+impl From<uart::TxError> for UartError {
+    fn from(value: uart::TxError) -> Self {
+        Self::TxError(value)
     }
-    info!("Marchid via pointer: {:x}", archid);
-    info!("Marchid via lib: {:x}", proper_arch.bits());
-    panic!("reached end");
+}
+
+impl From<uart::RxError> for UartError {
+    fn from(value: uart::RxError) -> Self {
+        Self::RxError(value)
+    }
+}
+
+fn get_radio_uart_speed<'d>(
+    uart0: &mut uart::Uart<'d, esp_hal::Blocking>,
+) -> Result<usize, UartError> {
+    let mut buf = [0u8; 256];
+    info!("Sending command...");
+    let bytes_written = uart0.write(b"ER_CMD#U?")?;
+    info!("Wrote {} bytes, Flushing buffer...", bytes_written);
+    uart0.flush()?;
+    info!("Buffer flushed, waiting for response...");
+    let bytes_read = uart0.read(&mut buf)?;
+    info!("Got response...");
+    if bytes_read == 0 {
+        panic!("Empty response received.");
+    }
+    let written = &buf[..bytes_read];
+    if written.starts_with(b"ER_CMD#U") {
+        match written[8] {
+            b'1' => Ok(2400),
+            b'2' => Ok(4800),
+            b'3' => Ok(9600),
+            b'4' => Ok(19200),
+            b'5' => Ok(38400),
+            b'6' => Ok(31250),
+            b'7' => Ok(76800),
+            b'8' => Ok(115200),
+            _ => panic!("Unknown response: {:?}", &buf[..bytes_read]),
+        }
+    } else {
+        panic!("Unknown response: {:?}", &buf[..bytes_read]);
+    }
 }
